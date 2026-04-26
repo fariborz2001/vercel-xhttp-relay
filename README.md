@@ -15,32 +15,49 @@ host is blocked but Vercel is reachable.
 ## How It Works
 
 ```
-┌──────────┐      TLS / SNI: *.vercel.app      ┌────────────────┐      HTTP        ┌──────────────┐
-│  Client  │ ────────────────────────────────► │  Vercel Edge   │ ───────────────► │  Your Xray   │
-│ (v2rayN, │   XHTTP (uplink + downlink over   │  (this relay,  │   XHTTP frames   │  Server with │
-│ xray-core│    plain HTTP/2 POST/GET reqs)    │   Rust runtime)│  proxied 1:1     │ XHTTP inbound│
-└──────────┘                                   └────────────────┘                  └──────────────┘
+┌──────────┐    TLS / SNI: *.vercel.app    ┌──────────────────┐    HTTP/2     ┌──────────────┐
+│  Client  │ ────────────────────────────► │   Vercel (this   │ ───────────►  │  Your Xray   │
+│ (v2rayN, │   XHTTP request (POST/GET)    │  Rust function)  │  XHTTP frames │  server with │
+│ xray-core│                               │  buffers + fwd   │  forwarded    │ XHTTP inbound│
+└──────────┘                               └──────────────────┘               └──────────────┘
 ```
 
-1. Your Xray client opens an XHTTP stream to a Vercel domain
+1. Your Xray client opens an XHTTP request to a Vercel domain
    (`your-app.vercel.app`, or any custom domain pointed at Vercel).
 2. The TLS handshake uses **Vercel's certificate / SNI**, so to a censor it
    looks like ordinary traffic to a legitimate Vercel-hosted site.
-3. This relay (deployed as a Vercel Edge function in Rust) receives the
-   request, forwards it verbatim — headers, method, body stream — to your
-   real Xray server defined by `TARGET_DOMAIN`.
-4. The response is streamed back to the client without buffering, so large
-   uploads/downloads stay low-latency.
+3. The Rust function receives the request, copies the headers, method, and
+   body, then issues an equivalent request to your real Xray server defined
+   by `TARGET_DOMAIN`.
+4. The upstream response (status, headers, body) is returned to the client.
 
-## Why Rust on Vercel Edge?
+## Important: Buffered, not Streamed
 
-- **Zero-buffer streaming** via `reqwest::bytes_stream()` +
-  `Body::from_stream()` — required for XHTTP's long-lived bidirectional
-  streams.
-- **Compiled native code** — header copying and method translation run in
-  microseconds, not milliseconds.
-- **Vercel's anycast edge** — clients connect to the closest PoP and benefit
-  from Vercel's optimized backbone to your origin.
+Vercel's Rust runtime is built on AWS Lambda's request/response model:
+the entire request body is buffered in memory before your handler runs,
+and the entire response body is buffered before being sent back. **There
+is no true bidirectional streaming.**
+
+This is why the relay is **XHTTP-only**:
+
+- XHTTP's `packet-up` / chunked POST mode uses many short, bounded HTTP
+  requests — each one fits naturally into Lambda's request/response model
+  and works through this relay without trouble.
+- Transports that rely on long-lived bidirectional streams (WebSocket,
+  gRPC, raw TCP, mKCP, QUIC) **cannot** work on Vercel's serverless Rust
+  runtime, regardless of how the relay is implemented.
+
+If you need true streaming behind Vercel, you'd need Vercel's Edge
+*Middleware* (JavaScript only, with `WebStreams`) — not the Rust runtime.
+
+## Why Rust?
+
+- **Compiled native code** — header copying and request building run in
+  microseconds, minimizing the relay's contribution to total latency.
+- **HTTP/2 client by default** (`reqwest` with `http2_prior_knowledge`)
+  — matches the protocol XHTTP backends speak.
+- **Vercel's anycast edge** — clients connect to the closest PoP and
+  benefit from Vercel's optimized backbone to your origin.
 
 ---
 
@@ -132,11 +149,14 @@ vless://UUID@your-app.vercel.app:443?encryption=none&security=tls&sni=your-app.v
 
 ## Limitations
 
-- **XHTTP only.** WebSocket / gRPC / raw TCP transports do **not** work
-  because Vercel's serverless functions don't expose those primitives.
-- **Vercel function execution limits.** Long-lived idle streams may be cut
-  by Vercel's per-invocation timeout. XHTTP's chunked POST/GET model handles
-  this gracefully, but other transports would not.
+- **XHTTP only.** WebSocket / gRPC / raw TCP / mKCP / QUIC transports do
+  **not** work because Vercel's serverless Rust runtime cannot stream.
+- **Bounded request size.** Each XHTTP request body is fully buffered in
+  memory by the runtime; very large single chunks may hit Vercel's request
+  size limit (≈ 4.5 MB for serverless functions).
+- **Function execution time.** Each request must finish within Vercel's
+  per-invocation timeout. XHTTP's chunked POST/GET model is short-lived
+  per request, so this is normally fine.
 - **Bandwidth costs.** All traffic counts against your Vercel account's
   bandwidth quota. Heavy use → upgrade to Pro/Enterprise.
 - **Logging.** Vercel logs request metadata (path, IP, status). The body is
@@ -146,8 +166,8 @@ vless://UUID@your-app.vercel.app:443?encryption=none&security=tls&sni=your-app.v
 
 ```
 .
-├── api/index.rs   # Edge function: streams request → TARGET_DOMAIN, streams response back
-├── Cargo.toml     # Rust dependencies (vercel_runtime, reqwest, tokio, futures-util)
+├── api/index.rs   # Serverless function: forwards request → TARGET_DOMAIN, returns response
+├── Cargo.toml     # Rust dependencies (vercel_runtime, reqwest, tokio)
 ├── vercel.json    # Routes all paths → /api/index, region pinned to fra1
 └── README.md
 ```
